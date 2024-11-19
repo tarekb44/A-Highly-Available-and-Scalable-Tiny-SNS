@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package csce662;
+
+service MasterSlaveService {
+  rpc ForwardUpdate (ClientUpdate) returns (Ack) {}
+}
+
+message ClientUpdate {
+  string username = 1;
+  string message = 2;
+}
+
+message Ack {
+  bool success = 1;
+}
