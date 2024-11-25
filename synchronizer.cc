@@ -83,7 +83,7 @@ std::vector<std::string> get_tl_or_fl(int, int, bool);
 std::vector<std::string> getFollowersOfUser(int);
 bool file_contains_user(std::string filename, std::string user);
 
-void Heartbeat(std::string coordinatorIp, std::string coordinatorPort, ServerInfo serverInfo, int syncID);
+void Heartbeat(std::string coordinatorIp, std::string coordinatorPort, csce662::ServerInfo serverInfo);
 
 std::unique_ptr<csce662::CoordService::Stub> coordinator_stub_;
 
@@ -145,11 +145,11 @@ public:
     SynchronizerRabbitMQ(const std::string &host, int p, int id) : hostname(host), port(p), channel(1), synchID(id)
     {
         setupRabbitMQ();
-        declareQueue("synch" + std::to_string(synchID) + "_users_queue");
-        declareQueue("synch" + std::to_string(synchID) + "_clients_relations_queue");
-        declareQueue("synch" + std::to_string(synchID) + "_timeline_queue");
-        // TODO: add or modify what kind of queues exist in your clusters based on your needs
+        declareQueue("users_queue");
+        declareQueue("relations_queue");
+        declareQueue("timeline_queue");
     }
+
 
     void publishUserList()
     {
@@ -163,34 +163,6 @@ public:
         Json::FastWriter writer;
         std::string message = writer.write(userList);
         publishMessage("synch" + std::to_string(synchID) + "_users_queue", message);
-    }
-
-    void consumeUserLists()
-    {
-        std::vector<std::string> allUsers;
-        // YOUR CODE HERE
-
-        // TODO: while the number of synchronizers is harcorded as 6 right now, you need to change this
-        // to use the correct number of follower synchronizers that exist overall
-        // accomplish this by making a gRPC request to the coordinator asking for the list of all follower synchronizers registered with it
-        for (int i = 1; i <= 6; i++)
-        {
-            std::string queueName = "synch" + std::to_string(i) + "_users_queue";
-            std::string message = consumeMessage(queueName, 1000); // 1 second timeout
-            if (!message.empty())
-            {
-                Json::Value root;
-                Json::Reader reader;
-                if (reader.parse(message, root))
-                {
-                    for (const auto &user : root["users"])
-                    {
-                        allUsers.push_back(user.asString());
-                    }
-                }
-            }
-        }
-        updateAllUsersFile(allUsers);
     }
 
     void publishClientRelations()
@@ -286,26 +258,20 @@ public:
             for (const auto &follower : followers)
             {
                 // send the timeline updates of your current user to all its followers
+                Json::Value timelineUpdate;
+              timelineUpdate["clientId"] = clientId;
+               timelineUpdate["timeline"] = Json::arrayValue;
+               for (const auto &line : timeline) {
+                   timelineUpdate["timeline"].append(line);
+               }
+               Json::FastWriter writer;
+               std::string message = writer.write(timelineUpdate);
 
-                // YOUR CODE HERE
+               publishMessage("synch" + std::to_string(clusterID) + "_timeline_queue", message);
             }
         }
     }
 
-    // For each client in your cluster, consume messages from your timeline queue and modify your client's timeline files based on what the users they follow posted to their timeline
-    void consumeTimelines()
-    {
-        std::string queueName = "synch" + std::to_string(synchID) + "_timeline_queue";
-        std::string message = consumeMessage(queueName, 1000); // 1 second timeout
-
-        if (!message.empty())
-        {
-            // consume the message from the queue and update the timeline file of the appropriate client with
-            // the new updates to the timeline of the user it follows
-
-            // YOUR CODE HERE
-        }
-    }
 
 private:
     void updateAllUsersFile(const std::vector<std::string> &users)
@@ -334,6 +300,26 @@ class SynchServiceImpl final : public SynchService::Service
     // You do not need to modify this in any way
 };
 
+void sendPeriodicHeartbeat(std::string coordinatorIp, std::string coordinatorPort, ServerInfo serverInfo) {
+    while (true) {
+        sleep(10);  // Adjust the heartbeat interval as needed
+
+        ClientContext context;
+        Confirmation confirmation;
+
+        // Add cluster ID to metadata
+        context.AddMetadata("clusterid", std::to_string(clusterID));
+
+        // Send heartbeat
+        Status status = coordinator_stub_->Heartbeat(&context, serverInfo, &confirmation);
+
+        if (!status.ok()) {
+            std::cout << "Failed to send heartbeat to coordinator: " << status.error_message() << std::endl;
+            exit(1);
+        }
+    }
+}
+
 void RunServer(std::string coordIP, std::string coordPort, std::string port_no, int synchID)
 {
     // localhost = 127.0.0.1
@@ -359,19 +345,179 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
 
     // Create a consumer thread
     std::thread consumerThread([&rabbitMQ]()
-                               {
+    {
         while (true) {
-            rabbitMQ.consumeUserLists();
-            rabbitMQ.consumeClientRelations();
-            rabbitMQ.consumeTimelines();
+            // rabbitMQ.consumeUserLists();
+            //rabbitMQ.consumeClientRelations();
+            //rabbitMQ.consumeTimelines();
             std::this_thread::sleep_for(std::chrono::seconds(5));
-            // you can modify this sleep period as per your choice
-        } });
+        } 
+    });
 
     server->Wait();
 
     //   t1.join();
     //   consumerThread.join();
+}
+
+void consumeTimelines() {
+    const std::string directoryPath = "./cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory;
+    const std::string timelineFilePath = directoryPath + "/timelines.txt";
+    
+    // Set up RabbitMQ connection
+    amqp_connection_state_t conn = amqp_new_connection();
+    amqp_socket_t *socket = amqp_tcp_socket_new(conn);
+    if (amqp_socket_open(socket, "localhost", 5672)) {
+        std::cerr << "Failed to connect to RabbitMQ" << std::endl;
+        amqp_destroy_connection(conn);
+        return;
+    }
+    amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+    amqp_channel_open(conn, 1);
+    amqp_get_rpc_reply(conn);
+
+    std::ifstream timelineFile(timelineFilePath);
+
+    if (!timelineFile.is_open()) {
+        std::cerr << "Failed to open timeline file at: " << timelineFilePath << std::endl;
+        amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+        amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+        amqp_destroy_connection(conn);
+        return;
+    }
+
+    std::string line;
+    std::unordered_set<std::string> publishedLines; // Tracks already published lines
+
+    while (true) {
+        while (std::getline(timelineFile, line)) {
+            if (publishedLines.find(line) != publishedLines.end()) {
+                continue;
+            }
+            publishedLines.insert(line);
+
+            amqp_basic_publish(
+                conn,
+                1,
+                amqp_empty_bytes,
+                amqp_cstring_bytes("timeline_queue"),
+                0,
+                0,
+                NULL,
+                amqp_cstring_bytes(line.c_str())
+            );
+
+            std::cout << "Published message: " << line << std::endl;
+        }
+
+        timelineFile.clear();
+        timelineFile.seekg(0, std::ios::cur);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    // Cleanup RabbitMQ connection
+    amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+    amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+    amqp_destroy_connection(conn);
+}
+
+
+/*
+ * Loop through the all_users.txt files to extract the user info from each cluster,
+    then using rabbitmq, update all the queues of each cluster so that they syncrhnoize from 
+    their side
+ */
+void continuouslyPublishHelloMessages(amqp_connection_state_t conn, amqp_channel_t channel, const std::string& queueName) {
+    while (true) {
+        for (int clusterID = 1; clusterID <= 3; ++clusterID) { 
+            for (const std::string& subdir : {"1", "2"}) {
+                std::string clusterDirectory = "./cluster_" + std::to_string(clusterID);
+                std::string clusterPath = clusterDirectory + "/" + subdir;
+                std::string usersFile = clusterPath + "/all_users.txt";
+
+                // Check if the file exists
+                if (std::filesystem::exists(usersFile)) {
+                    std::ifstream infile(usersFile);
+                    if (!infile.is_open()) {
+                        std::cerr << "Failed to open file: " << usersFile << std::endl;
+                        continue;
+                    }
+
+                    std::string line;
+                    while (std::getline(infile, line)) {
+                        std::istringstream iss(line);
+                        std::string username;
+                        if (std::getline(iss, username, ':')) {
+                            username.erase(username.find_last_not_of(" \n\r\t") + 1); // Trim trailing whitespace
+
+                            std::string followings;
+                            if (std::getline(iss, followings)) {
+                                followings.erase(followings.find_last_not_of(" \n\r\t") + 1); // Trim trailing whitespace
+                            }
+
+                            followings = followings.empty() ? "None" : followings;
+
+                            std::string message = username + ": " + followings;
+                            amqp_bytes_t messageBytes = amqp_cstring_bytes(message.c_str());
+
+                            //publish message to the queue
+                            amqp_basic_publish(
+                                conn,
+                                channel,
+                                amqp_empty_bytes,
+                                amqp_cstring_bytes(queueName.c_str()),
+                                0,
+                                0,
+                                NULL,
+                                messageBytes
+                            );
+
+                            // std::cout << "Published message: " << message << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Publish every 500ms
+    }
+}
+
+// initialize the main hello_queue which owuld be used by other servers
+// to listen on the 
+void initializeRabbitMQAndContinuouslyPublish() {
+    const std::string hostname = "localhost";
+    const int port = 5672;
+    const std::string queueName = "hello_queue";
+
+    amqp_connection_state_t conn = amqp_new_connection();
+    amqp_socket_t* socket = amqp_tcp_socket_new(conn);
+    if (amqp_socket_open(socket, hostname.c_str(), port)) {
+        throw std::runtime_error("Failed to open RabbitMQ connection.");
+    }
+
+    amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+    amqp_channel_open(conn, 1);
+    amqp_get_rpc_reply(conn);
+
+    // declate the main queue
+    amqp_queue_declare(
+        conn, 
+        1, 
+        amqp_cstring_bytes(queueName.c_str()), 
+        0, 
+        0, 
+        0, 
+        1, 
+        amqp_empty_table
+    );
+
+    continuouslyPublishHelloMessages(conn, 1, queueName);
+
+    amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+    amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+    amqp_destroy_connection(conn);
 }
 
 int main(int argc, char **argv)
@@ -408,17 +554,32 @@ int main(int argc, char **argv)
 
     coordAddr = coordIP + ":" + coordPort;
     clusterID = ((synchID - 1) % 3) + 1;
+
+    coordinator_stub_ = csce662::CoordService::NewStub(
+        grpc::CreateChannel(coordAddr, grpc::InsecureChannelCredentials()));
+
+
     ServerInfo serverInfo;
     serverInfo.set_hostname("localhost");
     serverInfo.set_port(port);
     serverInfo.set_type("synchronizer");
     serverInfo.set_serverid(synchID);
     serverInfo.set_clusterid(clusterID);
-    Heartbeat(coordIP, coordPort, serverInfo, synchID);
+    Heartbeat(coordIP, coordPort, serverInfo);
+
+    std::thread heartbeatThread(sendPeriodicHeartbeat, coordIP, coordPort, serverInfo);
+    heartbeatThread.detach();
+
+    std::thread rabbitThread(initializeRabbitMQAndContinuouslyPublish);
+    rabbitThread.detach();
+
+    std::thread timelineThread(consumeTimelines);
+    timelineThread.detach();
 
     RunServer(coordIP, coordPort, port, synchID);
     return 0;
 }
+
 
 void run_synchronizer(std::string coordIP, std::string coordPort, std::string port, int synchID, SynchronizerRabbitMQ &rabbitMQ)
 {
@@ -435,10 +596,8 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
     msg.set_port(port);
     msg.set_type("follower");
 
-    // TODO: begin synchronization process
     while (true)
     {
-        // the synchronizers sync files every 5 seconds
         sleep(5);
 
         grpc::ClientContext context;
@@ -446,7 +605,6 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         ID id;
         id.set_id(synchID);
 
-        // making a request to the coordinator to see count of follower synchronizers
         coord_stub_->GetAllFollowerServers(&context, id, &followerServers);
 
         std::vector<int> server_ids;
@@ -470,13 +628,19 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         // make any modifications as necessary to satisfy the assignments requirements
 
         // Publish user list
+        /*
+        rabbitMQ.continuouslyPublishHelloMessages(1, "hello_queue");
+
         rabbitMQ.publishUserList();
 
         // Publish client relations
         rabbitMQ.publishClientRelations();
 
         // Publish timelines
-        rabbitMQ.publishTimelines();
+        
+        */
+
+        // rabbitMQ.publishTimelines();
     }
     return;
 }
@@ -511,18 +675,23 @@ std::vector<std::string> get_lines_from_file(std::string filename)
     return users;
 }
 
-void Heartbeat(std::string coordinatorIp, std::string coordinatorPort, ServerInfo serverInfo, int syncID)
-{
-    // For the synchronizer, a single initial heartbeat RPC acts as an initialization method which
-    // servers to register the synchronizer with the coordinator and determine whether it is a master
+void Heartbeat(std::string coordinatorIp, std::string coordinatorPort, csce662::ServerInfo serverInfo) {
+    Confirmation confirmation;
 
-    log(INFO, "Sending initial heartbeat to coordinator");
-    std::string coordinatorInfo = coordinatorIp + ":" + coordinatorPort;
-    std::unique_ptr<CoordService::Stub> stub = std::unique_ptr<CoordService::Stub>(CoordService::NewStub(grpc::CreateChannel(coordinatorInfo, grpc::InsecureChannelCredentials())));
+    // Add cluster ID to metadata
+    ClientContext context;
+    context.AddMetadata("clusterid", std::to_string(clusterID));
 
-    // send a heartbeat to the coordinator, which registers your follower synchronizer as either a master or a slave
+    // Use the passed serverInfo
+    Status status = coordinator_stub_->Heartbeat(&context, serverInfo, &confirmation);
 
-    // YOUR CODE HERE
+    if (!status.ok()) {
+        std::cout << "Failed to send heartbeat to coordinator: " << status.error_message() << std::endl;
+        exit(1);
+    }
+
+    // Set clusterSubdirectory based on server type
+    clusterSubdirectory = "synch";  // Since synchronizers are neither master nor slave
 }
 
 bool file_contains_user(std::string filename, std::string user)

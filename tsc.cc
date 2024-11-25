@@ -10,6 +10,10 @@
 #include <csignal>
 #include <grpc++/grpc++.h>
 #include "client.h"
+#include <amqp.h>
+#include <amqp_tcp_socket.h>
+#include <amqp_framing.h>
+
 
 #include "coordinator.grpc.pb.h"
 #include "coordinator.pb.h"
@@ -360,6 +364,66 @@ std::string getPostMessageC() {
     return message;
 }
 
+void consumeTimelineMessages(amqp_connection_state_t conn, amqp_channel_t channel, const std::string& queueName) {
+    amqp_basic_consume(
+        conn, 
+        channel, 
+        amqp_cstring_bytes(queueName.c_str()), 
+        amqp_empty_bytes, 
+        0, 
+        0, // Manual acknowledgment
+        0, 
+        amqp_empty_table
+    );
+
+    while (!signalReceived) {
+        amqp_rpc_reply_t res;
+        amqp_envelope_t envelope;
+
+        amqp_maybe_release_buffers(conn);
+        res = amqp_consume_message(conn, &envelope, nullptr, 0);
+
+        if (AMQP_RESPONSE_NORMAL == res.reply_type) {
+            std::string message(static_cast<char*>(envelope.message.body.bytes), envelope.message.body.len);
+            std::cout << message << std::endl;
+
+            amqp_basic_ack(conn, channel, envelope.delivery_tag, 0);
+            amqp_destroy_envelope(&envelope);
+        } else {
+            std::cerr << "Failed to consume RabbitMQ message." << std::endl;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+void initializeRabbitMQAndConsumeTimelineMessages(const std::string& username) {
+    const std::string hostname = "localhost";
+    const int port = 5672;
+    const std::string queueName = "timeline_queue_" + username;
+
+    amqp_connection_state_t conn = amqp_new_connection();
+    amqp_socket_t* socket = amqp_tcp_socket_new(conn);
+
+    if (!socket || amqp_socket_open(socket, hostname.c_str(), port)) {
+        throw std::runtime_error("Failed to open RabbitMQ connection.");
+    }
+
+    amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+    amqp_channel_open(conn, 1);
+    amqp_get_rpc_reply(conn);
+
+    try {
+        consumeTimelineMessages(conn, 1, queueName);
+    } catch (const std::exception& ex) {
+        std::cerr << "Exception during timeline message consumption: " << ex.what() << std::endl;
+    }
+
+    amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+    amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+    amqp_destroy_connection(conn);
+}
+
 // Timeline Command
 void Client::Timeline(const std::string& username) {
 
@@ -430,35 +494,56 @@ void Client::Timeline(const std::string& username) {
         stream->WritesDone();
     });
 
-    // Reader thread to receive messages from the server
+    // Reader thread to receive messages from the server and RabbitMQ queue
+    // show updates from both
+    // rabbitmq will now show when in the same cluster
     std::thread reader_thread([&]() {
         Message received_message;
-        ClientContext context;
 
-        while (!signalReceived) { // safety checks to make sure the reader thread terminates upon SIGINT
-            if (stream->Read(&received_message)) {
-                std::string sender = received_message.username();
-                std::string message = received_message.msg();
-                std::time_t time = received_message.timestamp().seconds();
-                std::cout << message << std::endl; // printing the server's message via the stream to the timeline
-            } 
+        // this is a loop that is always listening to its timeline_[user_queue] for messages
+        try {
+            initializeRabbitMQAndConsumeTimelineMessages(username);
+        } catch (const std::exception& e) {
+            std::cerr << "Error initializing RabbitMQ: " << e.what() << std::endl;
         }
 
-        Request request; // cleanup of stream via calling unfollow as done above multiple times
+        // Cleanup gRPC stream
+        Request request;
         Reply reply;
         ClientContext context_term;
         context_term.AddMetadata("terminated", "true");
 
         request.set_username(username);
-
         grpc::Status status = this->stub_->UnFollow(&context_term, request, &reply);
         exit(1);
     });
 
+    // handle server messages
+    std::thread grpc_reader_thread([&]() {
+        Message received_message;
+
+        // Handle gRPC stream reading
+        while (!signalReceived) {
+            if (stream->Read(&received_message)) {
+                std::cout << received_message.msg() << std::endl;
+            }
+        }
+
+        // Cleanup gRPC stream
+        Request request;
+        Reply reply;
+        ClientContext context_term;
+        context_term.AddMetadata("terminated", "true");
+
+        request.set_username(username);
+        grpc::Status status = this->stub_->UnFollow(&context_term, request, &reply);
+        exit(1);
+    });
 
     // Join the threads (wait for them to finish)
     writer_thread.join();
     reader_thread.join();
+    grpc_reader_thread.join();
 
 }
 

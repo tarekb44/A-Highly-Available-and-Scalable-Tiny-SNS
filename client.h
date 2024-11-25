@@ -71,4 +71,3 @@ private:
   void toUpperCase(std::string& str) const;
 };
 
-

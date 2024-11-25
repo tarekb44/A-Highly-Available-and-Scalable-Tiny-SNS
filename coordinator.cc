@@ -53,6 +53,7 @@ struct zNode{
     std::time_t last_heartbeat;
     bool missed_heartbeat;
     bool isActive;
+    int clusterID;
 
     bool isAlive() {
         return !missed_heartbeat || difftime(getTimeNow(), last_heartbeat) < 20;
@@ -68,6 +69,7 @@ std::vector<zNode*> cluster3;
 // creating a vector of vectors containing znodes
 std::vector<std::vector<zNode*>> clusters = {cluster1, cluster2, cluster3};
 
+std::vector<zNode*> synchronizers;
 
 //func declarations
 int findServer(std::vector<zNode*> v, int id); 
@@ -117,6 +119,46 @@ class CoordServiceImpl final : public CoordService::Service {
         int serverID = serverinfo->serverid();
 
         std::cout<<"Received Heartbeat! ServerID: "<< processType <<"("<< serverID <<"), ClusterID: (" << clusterid << ")\n";
+
+        // process the synchronizers
+        if (processType == "synchronizer") {
+            v_mutex.lock();
+            auto node_it = std::find_if(synchronizers.begin(), synchronizers.end(), [serverID](zNode* node) {
+                return node->serverID == serverID;
+            });
+
+            if (node_it != synchronizers.end()) {
+                zNode* node = *node_it;
+                node->last_heartbeat = getTimeNow();
+                node->missed_heartbeat = false;
+                node->type = processType;
+                node->clusterID = intClusterid;
+            } else {
+                zNode* node = new zNode();
+                node->serverID = serverID;
+                node->hostname = serverinfo->hostname();
+                node->port = serverinfo->port();
+                node->type = processType;
+                node->last_heartbeat = getTimeNow();
+                node->missed_heartbeat = false;
+                node->isActive = true;
+                node->clusterID = intClusterid;
+                synchronizers.push_back(node);
+                std::cout << "New synchronizer registered in Cluster " << clusterid << std::endl;
+            }
+
+            v_mutex.unlock();
+
+            std::string synchProcessType;
+            auto it_process_type = metadata.find("process_type");
+            if (it_process_type != metadata.end()) {
+                synchProcessType = std::string(it_process_type->second.data(), it_process_type->second.length());
+            }
+
+
+            confirmation->set_status(true);
+            return Status::OK;
+        }
 
         v_mutex.lock();
         std::vector<zNode*>& cluster = clusters[intClusterid - 1];
@@ -220,8 +262,6 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-
-
 void checkHeartbeat(){
     while(true){
         v_mutex.lock();
@@ -259,10 +299,15 @@ void checkHeartbeat(){
             }
         }
 
+            for (auto& node : synchronizers) {
+                if (difftime(getTimeNow(), node->last_heartbeat) > 20) {
+                    node->missed_heartbeat = true;
+                    node->isActive = false;
+                    std::cout << "Synchronizer " << node->serverID << " in Cluster " << node->clusterID << " is inactive.\n";
+                }
+            }
+
         v_mutex.unlock();
         sleep(5);
     }
 }
-
-
-

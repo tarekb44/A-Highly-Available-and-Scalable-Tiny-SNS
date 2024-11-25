@@ -31,12 +31,17 @@
  *
  */
 
+#include <filesystem>
+#include <semaphore.h>  // For semaphores (sem_t, sem_open, etc.)
+#include <fcntl.h>  
 #include <cstddef>
 #include <cstdlib>
 #include <thread>
 #include <cstdio>
 #include <ctime>
 #include <csignal>
+#include <jsoncpp/json/json.h>
+#include <unordered_set>
 
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/duration.pb.h>
@@ -53,6 +58,10 @@
 #include <grpc++/grpc++.h>
 #include<glog/logging.h>
 #define log(severity, msg) LOG(severity) << msg; google::FlushLogFiles(google::severity); 
+
+#include <amqp.h>
+#include <amqp_tcp_socket.h>
+#include <amqp_framing.h>
 
 #include "sns.grpc.pb.h"
 #include "coordinator.grpc.pb.h"
@@ -85,7 +94,7 @@ using csce662::ClientUpdate;
 using csce662::Ack;
 
 
-
+std::string globalClusterid;
 struct Client {
     std::string username;
     bool connected = true;
@@ -101,6 +110,88 @@ struct Client {
     }
 };
 
+amqp_connection_state_t setupRabbitMQConnection() {
+    amqp_connection_state_t conn = amqp_new_connection();
+    amqp_socket_t *socket = amqp_tcp_socket_new(conn);
+    if (!socket) {
+        std::cerr << "Creating TCP socket failed" << std::endl;
+        exit(1);
+    }
+
+    int status = amqp_socket_open(socket, "localhost", 5672);
+    if (status) {
+        std::cerr << "Opening TCP socket failed" << std::endl;
+        exit(1);
+    }
+
+    amqp_rpc_reply_t loginReply = amqp_login(conn, "/", 0, 131072, 0,
+                                             AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+    if (loginReply.reply_type != AMQP_RESPONSE_NORMAL) {
+        std::cerr << "Logging in to RabbitMQ failed" << std::endl;
+        exit(1);
+    }
+
+    amqp_channel_open(conn, 1);
+    amqp_rpc_reply_t channelReply = amqp_get_rpc_reply(conn);
+    if (channelReply.reply_type != AMQP_RESPONSE_NORMAL) {
+        std::cerr << "Opening channel failed" << std::endl;
+        exit(1);
+    }
+
+    return conn;
+}
+
+void consumeAndCollectUsers(amqp_connection_state_t conn, const std::string &queueName, std::vector<std::string> &users) {
+    amqp_queue_declare(conn, 1, amqp_cstring_bytes(queueName.c_str()),
+                       0, 
+                       0,
+                       0, 
+                       1,
+                       amqp_empty_table);
+
+    // Start consuming messages
+    amqp_basic_consume(conn, 1, amqp_cstring_bytes(queueName.c_str()),
+                       amqp_empty_bytes,
+                       0, 
+                       1,
+                       0,
+                       amqp_empty_table);
+
+    amqp_rpc_reply_t res;
+    amqp_envelope_t envelope;
+
+    while (true) {
+        amqp_maybe_release_buffers(conn);
+        struct timeval timeout = {1, 0}; // 1-second timeout
+
+        res = amqp_consume_message(conn, &envelope, &timeout, 0);
+        if (AMQP_RESPONSE_NORMAL != res.reply_type) {
+            if (res.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION &&
+                res.library_error == AMQP_STATUS_TIMEOUT) {
+                break; // No more messages in the queue
+            } else {
+                std::cerr << "Error consuming message" << std::endl;
+                break;
+            }
+        }
+
+        std::string message((char *)envelope.message.body.bytes, envelope.message.body.len);
+
+        Json::Reader reader;
+        Json::Value root;
+        if (reader.parse(message, root)) {
+            const Json::Value usersJson = root["users"];
+            for (const auto &user : usersJson) {
+                users.push_back(user.asString());
+            }
+        } else {
+            std::cerr << "Failed to parse message: " << message << std::endl;
+        }
+
+        amqp_destroy_envelope(&envelope);
+    }
+}
+
 void checkHeartbeat();
 std::time_t getTimeNow();
 
@@ -115,7 +206,6 @@ bool isMaster = false;
 IReply Heartbeat(std::string clusterId, std::string serverId, std::string hostname, std::string port);
 
 
-//Vector that stores every client that has been created
 /* std::vector<Client*> client_db; */
 
 // using an unordered map to store clients rather than a vector as this allows for O(1) accessing and O(1) insertion
@@ -136,12 +226,10 @@ Client* getClient(std::string username){
 class SlaveServiceImpl final : public MasterSlaveService::Service {
  public:
   Status ForwardUpdate(ServerContext* context, const ClientUpdate* request, Ack* response) override {
-    // Process the update received from Master
     std::string username = request->username();
     std::string message = request->message();
 
-    // Write the update to the Slave's local storage
-    std::ofstream outfile("./cluster" + clusterId + "/2/" + username + ".txt", std::ios_base::app);
+    std::ofstream outfile("./cluster_" + clusterId + "/2/" + username + ".txt", std::ios_base::app);
     outfile << message << std::endl;
     outfile.close();
 
@@ -149,6 +237,143 @@ class SlaveServiceImpl final : public MasterSlaveService::Service {
     return Status::OK;
   }
 };
+
+void logClientDB() {
+    std::cout << "Current state of client_db:" << std::endl;
+    for (const auto& pair : client_db) {
+        Client* client = pair.second;
+        std::cout << "Client: " << client->username << std::endl;
+        std::cout << "  Following: ";
+        for (const auto& following : client->client_following) {
+            std::cout << following->username << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "  Followers: ";
+        for (const auto& follower : client->client_followers) {
+            std::cout << follower->username << " ";
+        }
+        std::cout << std::endl;
+    }
+}
+
+// this method is always listening and is always updating client_db
+void continuouslyConsumeMessages(amqp_connection_state_t conn, amqp_channel_t channel, const std::string& queueName) {
+    // consume from teh hello_queue for users
+    amqp_basic_consume(
+        conn, 
+        channel, 
+        amqp_cstring_bytes(queueName.c_str()), 
+        amqp_empty_bytes, 
+        0, 
+        0,
+        0, 
+        amqp_empty_table
+    );
+
+    while (true) {
+        amqp_rpc_reply_t res;
+        amqp_envelope_t envelope;
+
+        amqp_maybe_release_buffers(conn);
+
+        // consume the message
+        res = amqp_consume_message(conn, &envelope, NULL, 0);
+
+        if (AMQP_RESPONSE_NORMAL == res.reply_type) {
+            std::string message(static_cast<char*>(envelope.message.body.bytes), envelope.message.body.len);
+            std::istringstream iss(message);
+            std::string username, followings;
+
+            if (std::getline(iss, username, ':')) {
+                username.erase(username.find_last_not_of(" \n\r\t") + 1); // Trim whitespace
+
+                if (username.empty() || username == "None") {
+                    std::cerr << "Invalid username detected in message: " << message << std::endl;
+                    amqp_basic_ack(conn, channel, envelope.delivery_tag, 0);
+                    amqp_destroy_envelope(&envelope);
+                    continue;
+                }
+
+                // create a new client
+                Client* client = getClient(username);
+                if (!client) {
+                    client = new Client();
+                    client->username = username;
+                    client->connected = true;
+                    client->last_heartbeat = getTimeNow();
+                    client_db[username] = client;
+                }
+
+                if (std::getline(iss, followings)) {
+                    followings.erase(followings.find_last_not_of(" \n\r\t") + 1); // Trim whitespace
+                    std::istringstream followingStream(followings);
+                    std::string followingUsername;
+
+                    while (followingStream >> followingUsername) {
+                        if (followingUsername.empty() || followingUsername == "None") {
+                            std::cerr << "Invalid following username detected: " << followingUsername << std::endl;
+                            continue;
+                        }
+
+                        Client* followingClient = getClient(followingUsername);
+                        if (!followingClient) {
+                            followingClient = new Client();
+                            followingClient->username = followingUsername;
+                            followingClient->connected = true;
+                            followingClient->last_heartbeat = getTimeNow();
+                            client_db[followingUsername] = followingClient;
+                        }
+
+                        if (std::find(client->client_following.begin(), client->client_following.end(), followingClient) == client->client_following.end()) {
+                            client->client_following.push_back(followingClient);
+                        }
+
+                        if (std::find(followingClient->client_followers.begin(), followingClient->client_followers.end(), client) == followingClient->client_followers.end()) {
+                            followingClient->client_followers.push_back(client);
+                        }
+                    }
+                }
+            }
+
+            // logClientDB();
+
+            amqp_basic_ack(conn, channel, envelope.delivery_tag, 0);
+            amqp_destroy_envelope(&envelope);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+void initializeRabbitMQAndContinuouslyConsume() {
+    const std::string hostname = "localhost";
+    const int port = 5672;
+    const std::string queueName = "hello_queue";
+
+    amqp_connection_state_t conn = amqp_new_connection();
+    amqp_socket_t* socket = amqp_tcp_socket_new(conn);
+
+    if (!socket || amqp_socket_open(socket, hostname.c_str(), port)) {
+        throw std::runtime_error("Failed to open RabbitMQ connection.");
+    }
+
+    amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+    amqp_channel_open(conn, 1);
+    amqp_get_rpc_reply(conn);
+
+    try {
+        continuouslyConsumeMessages(conn, 1, queueName);
+    } catch (const std::exception& ex) {
+        std::cerr << "Exception in continuous consumption: " << ex.what() << std::endl;
+    }
+
+    // Cleanup
+    amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+    amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+    amqp_destroy_connection(conn);
+}
+
 
 class SNSServiceImpl final : public SNSService::Service {
 
@@ -191,7 +416,7 @@ class SNSServiceImpl final : public SNSService::Service {
 
         return Status::OK;
     }
-
+        
     Status Follow(ServerContext* context, const Request* request, Reply* reply) override {
 
         std::string u1 = request->username();
@@ -199,26 +424,65 @@ class SNSServiceImpl final : public SNSService::Service {
         Client* c1 = getClient(u1);
         Client* c2 = getClient(u2);
 
-        if (c1 == nullptr || c2 == nullptr) { // either of the clients dont exist
+        if (c1 == nullptr || c2 == nullptr) { // either of the clients don't exist
             return Status(grpc::CANCELLED, "invalid username");
         }
 
-        if (c1 == c2){ // if a client is asked to follow itself
+        if (c1 == c2) { // if a client is asked to follow itself
             return Status(grpc::CANCELLED, "same client");
         }
 
-
-
-        // check if the client to follow is already being followed
+        // Check if the client to follow is already being followed
         bool isAlreadyFollowing = std::find(c1->client_following.begin(), c1->client_following.end(), c2) != c1->client_following.end();
 
         if (isAlreadyFollowing) {
             return Status(grpc::CANCELLED, "already following");
         }
 
-        // add the clients to each other's relevant vector
+        // Add the clients to each other's relevant vector
         c1->client_following.push_back(c2);
         c2->client_followers.push_back(c1);
+
+        // Ensure cluster directory structure
+        int clusterID = std::stoi(clusterId); // Assuming clusterId is accessible globally
+        std::string clusterDirectory = "./cluster_" + std::to_string(clusterID);
+        std::string clusterSubdirectory = "1"; // Adjust as needed for cluster-specific subdirectories
+        std::string clusterPath = clusterDirectory + "/" + clusterSubdirectory;
+        std::string usersFile = clusterPath + "/all_users.txt";
+        std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_all_users.txt";
+
+        // Create directories if they do not exist
+        std::filesystem::create_directories(clusterPath);
+
+        sem_t* fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+        if (fileSem == SEM_FAILED) {
+            return Status(grpc::INTERNAL, "Semaphore creation failed");
+        }
+
+        sem_wait(fileSem);
+        {
+            // Open the file and update the user list
+            std::ofstream file(usersFile, std::ios::trunc);
+            if (file.is_open()) {
+                for (const auto& pair : client_db) {
+                    Client* client = pair.second;
+                    file << client->username << ": ";
+                    for (const auto& following : client->client_following) {
+                        file << following->username << " ";
+                    }
+                    file << std::endl;
+                }
+                file.close();
+            } else {
+                sem_post(fileSem);
+                sem_close(fileSem);
+                return Status(grpc::INTERNAL, "Failed to open users file");
+            }
+        }
+        sem_post(fileSem);
+        sem_close(fileSem);
+
+        std::cout << u1 << " is now following " << u2 << std::endl;
 
         return Status::OK; 
     }
@@ -226,46 +490,38 @@ class SNSServiceImpl final : public SNSService::Service {
     Status UnFollow(ServerContext* context, const Request* request, Reply* reply) override {
 
         std::string username = request->username();
-        // using a multimap to fetch the metadata out of the client's servercontext so we can check to see if a SIGINT was issued on the client's timeline
         const std::multimap<grpc::string_ref, grpc::string_ref>& metadata = context->client_metadata();
 
         auto it = metadata.find("terminated");
         if (it != metadata.end()) {
             std::string customValue(it->second.data(), it->second.length());
+            std::string termStatus = customValue;
 
-            std::string termStatus = customValue; // checking the value of the key "terminated" from the metadata in servercontext
-            if (termStatus == "true"){
-
+            if (termStatus == "true") {
                 Client* c = getClient(username);
-                if (c != NULL){ // if the client exists, change its connection status and set its stream to null
+                if (c != nullptr) {
                     c->last_heartbeat = getTimeNow();
                     c->connected = false;
                     c->stream = nullptr;
                 }
-                // DO NOT CONTINUE WITH UNFOLLOW AFTER THIS
-                // Terminate here as this was not an actual unfollow request and just a makeshift way to handle SIGINTs on the client side
                 return Status::OK;
             }
-
         }
-
 
         std::string u1 = request->username();
         std::string u2 = request->arguments(0);
         Client* c1 = getClient(u1);
         Client* c2 = getClient(u2);
 
-
         if (c1 == nullptr || c2 == nullptr) {
             return Status(grpc::CANCELLED, "invalid username");
         }
 
-        if (c1 == c2){
+        if (c1 == c2) {
             return Status(grpc::CANCELLED, "same client");
         }
 
-
-        // Find and erase c2 from c1's following
+        // Find and remove c2 from c1's following list
         auto it1 = std::find(c1->client_following.begin(), c1->client_following.end(), c2);
         if (it1 != c1->client_following.end()) {
             c1->client_following.erase(it1);
@@ -273,12 +529,45 @@ class SNSServiceImpl final : public SNSService::Service {
             return Status(grpc::CANCELLED, "not following");
         }
 
-        // if it gets here, it means it was following the other client
-        // Find and erase c1 from c2's followers
+        // Find and remove c1 from c2's followers list
         auto it2 = std::find(c2->client_followers.begin(), c2->client_followers.end(), c1);
         if (it2 != c2->client_followers.end()) {
             c2->client_followers.erase(it2);
         }
+
+        // Update cluster files for both users
+        int clusterID = std::stoi(clusterId);  // Assuming clusterId is accessible globally
+        std::string clusterSubdirectory = "1";  // Adjust as needed for cluster-specific subdirectories
+        std::string usersFile = "./cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory + "/all_users.txt";
+        std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_all_users.txt";
+
+        sem_t* fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+        if (fileSem == SEM_FAILED) {
+            return Status(grpc::INTERNAL, "Semaphore creation failed");
+        }
+
+        sem_wait(fileSem);
+        {
+            // Open the file and write updated user lists
+            std::ofstream file(usersFile, std::ios::trunc);
+            if (file.is_open()) {
+                for (const auto& pair : client_db) {
+                    Client* client = pair.second;
+                    file << client->username << ": ";
+                    for (const auto& following : client->client_following) {
+                        file << following->username << " ";
+                    }
+                    file << std::endl;
+                }
+                file.close();
+            } else {
+                sem_post(fileSem);
+                sem_close(fileSem);
+                return Status(grpc::INTERNAL, "Failed to open users file");
+            }
+        }
+        sem_post(fileSem);
+        sem_close(fileSem);
 
         return Status::OK;
     }
@@ -289,26 +578,74 @@ class SNSServiceImpl final : public SNSService::Service {
         std::string username = request->username();
 
         Client* c = getClient(username);
-        // if c exists 
-        if (c != NULL){
-            //  if an instance of the user is already active
-            if (c->connected){
+        bool isNewClient = false;
+
+        // Check if the client exists
+        if (c != nullptr) {
+            // If the client is already active
+            if (c->connected) {
                 c->missed_heartbeat = false;
                 return Status::CANCELLED;
-            } else { // this means the user was previously active, but inactive until just now
+            } else {
+                // Client was previously inactive, mark as connected
                 c->connected = true;
                 c->last_heartbeat = getTimeNow();
                 c->missed_heartbeat = false;
-                return Status::OK;
             }
         } else {
-            // create a new client as this is a first time request from a new client
+            // Create a new client if it doesn't exist
             Client* newc = new Client();
             newc->username = username;
             newc->connected = true;
             newc->last_heartbeat = getTimeNow();
             newc->missed_heartbeat = false;
             client_db[username] = newc;
+            isNewClient = true;
+        }
+
+        // Ensure cluster directory structure
+        int clusterID = std::stoi(clusterId);  // Assuming clusterId is accessible globally
+        std::string clusterDirectory = "./cluster_" + std::to_string(clusterID);
+        std::string clusterSubdirectory = "1";  // Adjust as needed for cluster-specific subdirectories
+        std::string clusterPath = clusterDirectory + "/" + clusterSubdirectory;
+        std::string usersFile = clusterPath + "/all_users.txt";
+        std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_all_users.txt";
+
+        // Create directories if they do not exist
+        std::filesystem::create_directories(clusterPath);
+
+        sem_t* fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+        if (fileSem == SEM_FAILED) {
+            return Status(grpc::INTERNAL, "Semaphore creation failed");
+        }
+
+        sem_wait(fileSem);
+        {
+            // Open the file and update the user list
+            std::ofstream file(usersFile, std::ios::trunc);
+            if (file.is_open()) {
+                for (const auto& pair : client_db) {
+                    Client* client = pair.second;
+                    file << client->username << ": ";
+                    for (const auto& following : client->client_following) {
+                        file << following->username << " ";
+                    }
+                    file << std::endl;
+                }
+                file.close();
+            } else {
+                sem_post(fileSem);
+                sem_close(fileSem);
+                return Status(grpc::INTERNAL, "Failed to open users file");
+            }
+        }
+        sem_post(fileSem);
+        sem_close(fileSem);
+
+        if (isNewClient) {
+            std::cout << "New client registered: " << username << std::endl;
+        } else {
+            std::cout << "Client reconnected: " << username << std::endl;
         }
 
         return Status::OK;
@@ -326,24 +663,26 @@ class SNSServiceImpl final : public SNSService::Service {
         std::vector<std::string> allMessages;
         bool firstTimelineStream = true;
 
-
-        // multimap to fetch metadata from the servercontext which contains the username of the current client
-        // this helps to Initialize the stream for this client as this is first contact
-        const std::multimap<grpc::string_ref, grpc::string_ref>& metadata = context->client_metadata();
-
+        // Fetch metadata to get the username of the current client
+        const auto& metadata = context->client_metadata();
         auto it = metadata.find("username");
         if (it != metadata.end()) {
             std::string customValue(it->second.data(), it->second.length());
-
-            // customValue is the username from the metadata received from the client
-            u = customValue;
+            u = customValue;  // Username from metadata
             c = getClient(u);
-            c->stream = stream; // set the client's stream to be the current stream
+            if (c) {
+                c->stream = stream;  // Associate this stream with the client
+                std::cout << "Timeline RPC invoked for user: " << u << std::endl;
+            } else {
+                std::cerr << "Client not found for username: " << u << std::endl;
+            }
+        } else {
+            std::cerr << "No username found in metadata." << std::endl;
         }
 
-        // if this is the first time the client is logging back 
+        // If this is the first time the client is logging in, send the latest messages
         if (firstTimelineStream && c != nullptr) {
-            // Read latest 20 messages from following file
+            // Read latest messages from the following file
             std::ifstream followingFile(u + "_following.txt");
             if (followingFile.is_open()) {
                 std::string line;
@@ -358,22 +697,26 @@ class SNSServiceImpl final : public SNSService::Service {
                 for (int i = startIndex; i < allMessages.size(); ++i) {
                     latestMessages.push_back(allMessages[i]);
                 }
-                std::reverse(latestMessages.begin(), latestMessages.end()); // reversing the vector to match the assignment description
+                std::reverse(latestMessages.begin(), latestMessages.end()); // Match assignment order
                 followingFile.close();
+            } else {
+                std::cerr << "Failed to open following file for user: " << u << std::endl;
             }
 
-            // Send latest 20 messages to client via the grpc stream
+            // Send the latest messages to the client
             for (const std::string& msg : latestMessages) {
                 Message latestMessage;
                 latestMessage.set_msg(msg + "\n");
-                stream->Write(latestMessage);
+                std::cout << "Sending initial message to " << u << ": " << msg << std::endl;
+                if (!stream->Write(latestMessage)) {
+                    std::cerr << "Failed to write initial message to client: " << u << std::endl;
+                }
             }
             firstTimelineStream = false;
         }
 
-
+        // Read messages from the client
         while (stream->Read(&m)) {
-
             if (c != nullptr) {
 
                 std::time_t timestamp_seconds = m.timestamp().seconds();
@@ -383,14 +726,23 @@ class SNSServiceImpl final : public SNSService::Service {
                 std::strftime(time_str, sizeof(time_str), "%a %b %d %T %Y", timestamp_tm);
 
                 std::string ffo = u + '(' + time_str + ')' + " >> " + m.msg();
+                std::cout << "Received message from " << u << ": " << m.msg() << std::endl;
 
-                std::string filepath = "./cluster" + clusterId + "/1/" + u + ".txt";
-                std::ofstream userFile(filepath, std::ios_base::app);
-                if (userFile.is_open()) {
-                    userFile << ffo << std::endl;
-                    userFile.close();
+                // create the timeline path
+                std::string timelineFilePath = "./cluster_" + clusterId + "/1/" + u + "_timeline.txt";
+                std::cout << "Writing to timeline file: " << timelineFilePath << std::endl;
+
+                // write tto the timeline path
+                std::ofstream timelineFile(timelineFilePath, std::ios_base::app);
+                if (timelineFile.is_open()) {
+                    timelineFile << ffo << std::endl;
+                    timelineFile.close();
+                    std::cout << "Successfully wrote to timeline file: " << ffo << std::endl;
+                } else {
+                    std::cerr << "Failed to open timeline file: " << timelineFilePath << std::endl;
                 }
 
+                // update the slave too
                 if (isMaster && slave_stub_) {
                     ClientUpdate update;
                     update.set_username(u);
@@ -402,36 +754,117 @@ class SNSServiceImpl final : public SNSService::Service {
 
                     if (!status.ok()) {
                         std::cout << "Failed to forward update to Slave: " << status.error_message() << std::endl;
+                    } else {
+                        std::cout << "Successfully forwarded update to Slave for user: " << u << std::endl;
                     }
                 }
 
+                // since c->client_followers is updated from the syncrhonizer
+                // stream this to its rabbitmq queue
                 for (Client* follower : c->client_followers) {
-                    if (follower->stream != nullptr) {
-                        Message followerMessage;
-                        followerMessage.set_msg(ffo);
+                    std::cout << "Notifying follower: " << follower->username << std::endl;
 
-                        if (follower->stream != nullptr) {
-                            follower->stream->Write(followerMessage);
-                        } 
-                    } 
-                }
+                    std::string followerQueueName = "timeline_queue_" + follower->username;
 
-                for (Client* follower : c->client_followers) {
-                    std::string follower_filepath = "./cluster" + clusterId + "/1/" + follower->username + "_following.txt";
-                    std::ofstream followerFile(follower_filepath, std::ios_base::app);
-                    if (followerFile.is_open()) {
-                        followerFile << ffo << std::endl;
-                        followerFile.close();
+                    try {
+                        amqp_connection_state_t conn = amqp_new_connection();
+                        amqp_socket_t* socket = amqp_tcp_socket_new(conn);
+                        if (!socket) {
+                            std::cerr << "Failed to create RabbitMQ TCP socket." << std::endl;
+                            continue;
+                        }
+
+                        if (amqp_socket_open(socket, "localhost", 5672)) {
+                            std::cerr << "Failed to open RabbitMQ socket to localhost:5672" << std::endl;
+                            continue;
+                        }
+
+                        amqp_rpc_reply_t loginReply = amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
+                        if (loginReply.reply_type != AMQP_RESPONSE_NORMAL) {
+                            std::cerr << "Failed to log in to RabbitMQ." << std::endl;
+                            continue;
+                        }
+
+                        amqp_channel_open(conn, 1);
+                        amqp_rpc_reply_t openChannelReply = amqp_get_rpc_reply(conn);
+                        if (openChannelReply.reply_type != AMQP_RESPONSE_NORMAL) {
+                            std::cerr << "Failed to open RabbitMQ channel." << std::endl;
+                            continue;
+                        }
+
+                        amqp_queue_declare_ok_t* queueDeclareReply = amqp_queue_declare(
+                            conn, 1, amqp_cstring_bytes(followerQueueName.c_str()), 0, 1, 0, 0, amqp_empty_table
+                        );
+
+                        if (!queueDeclareReply) {
+                            std::cerr << "Failed to declare RabbitMQ queue: " << followerQueueName << std::endl;
+                            continue;
+                        }
+
+                        std::cout << "RabbitMQ: Successfully declared queue " << followerQueueName << std::endl;
+
+                        // publish the timeline message from the client
+                        int publishResult = amqp_basic_publish(
+                            conn, 1, amqp_cstring_bytes(""), amqp_cstring_bytes(followerQueueName.c_str()),
+                            0, 0, nullptr, amqp_cstring_bytes(ffo.c_str())
+                        );
+
+                        if (publishResult < 0) {
+                            std::cerr << "Failed to publish message to RabbitMQ queue: " << followerQueueName << std::endl;
+                        } else {
+                            std::cout << "RabbitMQ: Successfully published message to " << followerQueueName << ": " << ffo << std::endl;
+                        }
+
+                        amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+                        amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+                        amqp_destroy_connection(conn);
+
+                    } catch (const std::exception& e) {
+                        std::cerr << "RabbitMQ: Exception encountered: " << e.what() << std::endl;
                     }
                 }
-            } 
+
+                // this is used to update the follower path of the client 
+                for (Client* follower : c->client_followers) {
+                    std::string follower_filepath = "./cluster_" + clusterId + "/1/" + follower->username + "_following.txt";
+                    
+                    if (std::filesystem::exists(follower_filepath)) {
+                        std::ofstream followerFile(follower_filepath, std::ios_base::app);
+                        if (followerFile.is_open()) {
+                            followerFile << ffo << std::endl;
+                            followerFile.close();
+                            std::cout << "Updated following file for follower: " << follower->username << std::endl;
+
+                            if (follower->stream != nullptr) {
+                                Message updateMessage;
+                                updateMessage.set_msg(ffo + "\n");  // Add a newline for readability
+                                std::cout << "Sending update message to follower " << follower->username << ": " << ffo << std::endl;
+                                
+                                // attempt to write the message to the follower's stream
+                                if (!follower->stream->Write(updateMessage)) {
+                                    std::cerr << "Failed to write update message to follower: " << follower->username << std::endl;
+                                }
+                            } else {
+                                std::cerr << "Follower stream is null for user: " << follower->username << std::endl;
+                            }
+                        } else {
+                            std::cerr << "Failed to open following file for follower: " << follower->username << std::endl;
+                        }
+                    } else {
+                        std::cerr << "Following file does not exist for follower: " << follower->username << std::endl;
+                    }
+                }
+
+
+            } else {
+                std::cerr << "Client object is null. Cannot process message." << std::endl;
+            }
         }
 
         return Status::OK;
     }
-
-
 };
+
 
 // function that sends a heartbeat to the coordinator
 IReply Heartbeat(std::string clusterId, std::string serverId, std::string hostname, std::string port, bool isHeartbeat, std::string processType) {
@@ -492,6 +925,7 @@ void RunServer(std::string clusterId_, std::string serverId_, std::string coordi
     isMaster = (serverId == "1");
     std::string processType = isMaster ? "master" : "slave";
 
+    // if this is a master and it dies, then the failover process starts
     if (isMaster) {
         SNSServiceImpl service;
 
@@ -509,6 +943,11 @@ void RunServer(std::string clusterId_, std::string serverId_, std::string coordi
 
         std::thread myhb(sendHeartbeat, clusterId, serverId, "localhost", port_no, processType);
         myhb.detach();
+
+        // this thread is constantly listening ot the hello_queue which is updated from 
+        // synchronizers
+        std::thread hbb(initializeRabbitMQAndContinuouslyConsume);
+        hbb.detach();
 
         std::thread hb(checkHeartbeat);
         hb.detach();
@@ -535,6 +974,9 @@ void RunServer(std::string clusterId_, std::string serverId_, std::string coordi
         std::thread myhb(sendHeartbeat, clusterId, serverId, "localhost", port_no, processType);
         myhb.detach();
 
+        std::thread hbb(initializeRabbitMQAndContinuouslyConsume);
+        hbb.detach();
+
         std::thread hb(checkHeartbeat);
         hb.detach();
 
@@ -547,7 +989,6 @@ void RunServer(std::string clusterId_, std::string serverId_, std::string coordi
         server->Wait();
     }
 }
-
 
 
 void checkHeartbeat(){
@@ -600,13 +1041,10 @@ int main(int argc, char** argv) {
         }
     }
 
-
     std::string log_file_name = std::string("server-") + port;
     google::InitGoogleLogging(log_file_name.c_str());
     log(INFO, "Logging Initialized. Server starting...");
 
-    /* RunServer(port); */
-    // changing this call so i can pass other auxilliary variables to be able to communicate with the server
     RunServer(clusterId, serverId, coordinatorIP, coordinatorPort, port);
 
     return 0;
